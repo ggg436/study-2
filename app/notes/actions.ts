@@ -3,16 +3,26 @@
 import { db } from "@/db";
 import { notes } from "@/db/schema";
 import { revalidatePath } from "next/cache";
+import { writeFile, mkdir } from "fs/promises";
+import path from "path";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 
-// Initialize S3 Client
-const s3Client = new S3Client({
-    region: process.env.AWS_REGION!,
-    credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
-    },
-});
+function getS3Client() {
+    if (
+        process.env.AWS_REGION &&
+        process.env.AWS_ACCESS_KEY_ID &&
+        process.env.AWS_SECRET_ACCESS_KEY
+    ) {
+        return new S3Client({
+            region: process.env.AWS_REGION,
+            credentials: {
+                accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+                secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+            },
+        });
+    }
+    return null;
+}
 
 export async function uploadNote(formData: FormData) {
     const file = formData.get("file") as File;
@@ -29,26 +39,42 @@ export async function uploadNote(formData: FormData) {
     const safeFilename = file.name.replace(/[^a-z0-9.]/gi, '_').toLowerCase();
     const storedFilename = `${uniqueSuffix}-${safeFilename}`;
 
-    // Upload to S3
-    await s3Client.send(
-        new PutObjectCommand({
-            Bucket: process.env.AWS_BUCKET_NAME!,
-            Key: storedFilename,
-            Body: buffer,
-            ContentType: file.type,
-            // ACL: "public-read", // Uncomment if bucket allows ACLs, otherwise use bucket policy
-        })
-    );
+    let filePath = "";
 
-    // Construct Public URL (Assuming standard public access)
-    // For private buckets, you would need to implement Pre-signed URLs for viewing
-    const fileUrl = `https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${storedFilename}`;
+    const s3Client = getS3Client();
+
+    if (s3Client && process.env.AWS_BUCKET_NAME) {
+        // === AWS S3 Upload ===
+        console.log("Uploading to AWS S3...");
+        await s3Client.send(
+            new PutObjectCommand({
+                Bucket: process.env.AWS_BUCKET_NAME,
+                Key: storedFilename,
+                Body: buffer,
+                ContentType: file.type,
+            })
+        );
+        filePath = `https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${storedFilename}`;
+    } else {
+        // === Local Filesystem Upload ===
+        console.log("AWS keys not found, uploading to local filesystem...");
+        const uploadDir = path.join(process.cwd(), "public", "uploads");
+        try {
+            await mkdir(uploadDir, { recursive: true });
+        } catch (e) {
+            // Ignore if exists
+        }
+
+        const localPath = path.join(uploadDir, storedFilename);
+        await writeFile(localPath, buffer);
+        filePath = `/uploads/${storedFilename}`;
+    }
 
     // Save to DB
     await db.insert(notes).values({
         title: title,
         fileName: file.name,
-        filePath: fileUrl,
+        filePath: filePath,
         fileSize: (file.size / 1024).toFixed(2) + ' KB',
     });
 
